@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import time
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
@@ -9,6 +11,7 @@ from moloni_tools import (
     create_supplier_invoice,
     get_suppliers,
     get_product_categories,
+    get_products_by_category,
     create_product_category,
 )
 
@@ -16,6 +19,11 @@ from moloni_tools import (
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
 mcp = FastMCP("moloni")
+
+# Reference lookup cache: {reference: (monotonic_timestamp, product_or_None)}
+_ref_cache: dict[str, tuple[float, dict | None]] = {}
+_CACHE_TTL = 60.0
+_CACHE_MAX = 256
 
 
 class BearerAuthMiddleware:
@@ -66,13 +74,41 @@ def ping() -> str:
 
 
 @mcp.tool()
-def search_product_by_reference(reference: str) -> dict:
+async def search_product_by_reference(reference: str) -> dict:
     """
     Search Moloni by exact product reference (case-insensitive).
     Always call this BEFORE create_product_in_moloni.
     Returns {found, product_id, name, price, category_id} on match, {found: false} on miss.
+    Returns {found: false, error: "moloni_timeout"} if Moloni does not respond within 15 s.
+    Results are cached for 60 s — safe to call multiple times for the same reference.
+    Prefer list_products_by_category when checking many references under the same category.
     """
-    product = product_by_reference(reference)
+    now = time.monotonic()
+    cached = _ref_cache.get(reference)
+    if cached and now - cached[0] < _CACHE_TTL:
+        product = cached[1]
+        if product is None:
+            return {"found": False}
+        return {
+            "found": True,
+            "product_id": product.get("product_id"),
+            "name": product.get("name"),
+            "price": product.get("price"),
+            "category_id": product.get("category_id"),
+        }
+
+    try:
+        product = await asyncio.wait_for(
+            asyncio.to_thread(product_by_reference, reference),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        return {"found": False, "error": "moloni_timeout"}
+
+    if len(_ref_cache) >= _CACHE_MAX:
+        _ref_cache.clear()
+    _ref_cache[reference] = (time.monotonic(), product)
+
     if not product:
         return {"found": False}
     return {
@@ -167,6 +203,30 @@ def list_product_categories(parent_id: int = 0) -> list:
     Returns all categories when parent_id=0.
     """
     return get_product_categories(parent_id=parent_id)
+
+
+@mcp.tool()
+async def list_products_by_category(category_id: int) -> list[dict]:
+    """List every product under a Moloni category in a single call.
+    Use this to check existence of multiple product references against one
+    parent category. Much faster than calling search_product_by_reference
+    multiple times — only one Moloni API call is needed per category.
+    Returns a list of objects: [{"product_id": int, "reference": str,
+    "name": str, "price": float, "category_id": int, "ean": str}, ...].
+    Empty list if the category has no products.
+    """
+    raw = await asyncio.to_thread(get_products_by_category, category_id)
+    return [
+        {
+            "product_id": p.get("product_id") or 0,
+            "reference": p.get("reference") or "",
+            "name": p.get("name") or "",
+            "price": float(p.get("price") or 0),
+            "category_id": p.get("category_id") or 0,
+            "ean": p.get("ean") or "",
+        }
+        for p in (raw if isinstance(raw, list) else [])
+    ]
 
 
 @mcp.tool()
