@@ -172,3 +172,25 @@ def create_product_category(name: str, parent_id: int = 0) -> dict:
     return moloni_post("productCategories/insert", body)
 
 
+def get_products_by_category(category_id: int) -> list:
+    PAGE_SIZE = 50
+    MAX_PAGES = 200
+    results = []
+    offset = 0
+    for _ in range(MAX_PAGES):
+        body = {
+            "company_id": COMPANY_ID,
+            "category_id": category_id,
+            "qty": PAGE_SIZE,
+            "offset": offset,
+        }
+        page = moloni_post("products/getAll", body)
+        if not isinstance(page, list):
+            break
+        results.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return results
+
+
