@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 
@@ -22,8 +23,15 @@ mcp = FastMCP("moloni")
 
 # Reference lookup cache: {reference: (monotonic_timestamp, product_or_None)}
 _ref_cache: dict[str, tuple[float, dict | None]] = {}
+_category_products_cache: dict[tuple[int, bool], tuple[float, list[dict]]] = {}
 _CACHE_TTL = 60.0
 _CACHE_MAX = 256
+
+_MAX_CATEGORY_VISITS = 100
+_MAX_PRODUCTS_COLLECTED = 10_000
+_CATEGORY_LIST_CONCURRENCY = 6
+_CATEGORY_LIST_TIMEOUT_FLAT = 60.0
+_CATEGORY_LIST_TIMEOUT_RECURSIVE = 180.0
 
 
 class BearerAuthMiddleware:
@@ -65,6 +73,111 @@ def normalize_supplier_invoice_products(products):
             "taxes": p.get("taxes", []),
         })
     return normalized
+
+
+def _normalize_product_rows(raw: list) -> list[dict]:
+    return [
+        {
+            "product_id": p.get("product_id") or 0,
+            "reference": p.get("reference") or "",
+            "name": p.get("name") or "",
+            "price": float(p.get("price") or 0),
+            "category_id": p.get("category_id") or 0,
+            "ean": p.get("ean") or "",
+        }
+        for p in raw
+        if isinstance(p, dict)
+    ]
+
+
+def _child_category_ids_from_response(rows) -> list[int]:
+    if not isinstance(rows, list):
+        return []
+    out: list[int] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = row.get("category_id")
+        if cid is None:
+            continue
+        try:
+            out.append(int(cid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _dedupe_raw_products_by_id(products: list) -> list:
+    seen: set[int] = set()
+    out = []
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("product_id")
+        if pid is not None:
+            try:
+                pid_i = int(pid)
+            except (TypeError, ValueError):
+                pid_i = None
+        else:
+            pid_i = None
+        if pid_i is not None:
+            if pid_i in seen:
+                continue
+            seen.add(pid_i)
+        out.append(p)
+    return out
+
+
+async def _list_products_by_category_uncached(category_id: int, recursive: bool) -> list[dict]:
+    if not recursive:
+        raw = await asyncio.to_thread(get_products_by_category, category_id)
+        return _normalize_product_rows(raw if isinstance(raw, list) else [])
+
+    queue: deque[int] = deque([category_id])
+    processed: set[int] = set()
+    accum: list = []
+    sem = asyncio.Semaphore(_CATEGORY_LIST_CONCURRENCY)
+
+    async def work(cid: int):
+        async with sem:
+            children = await asyncio.to_thread(get_product_categories, cid)
+        async with sem:
+            products = await asyncio.to_thread(get_products_by_category, cid)
+        return children, products
+
+    while (
+        queue
+        and len(processed) < _MAX_CATEGORY_VISITS
+        and len(accum) < _MAX_PRODUCTS_COLLECTED
+    ):
+        batch: list[int] = []
+        while (
+            queue
+            and len(batch) < _CATEGORY_LIST_CONCURRENCY
+            and len(processed) + len(batch) < _MAX_CATEGORY_VISITS
+        ):
+            cid = queue.popleft()
+            if cid in processed:
+                continue
+            batch.append(cid)
+        if not batch:
+            break
+        outcomes = await asyncio.gather(*(work(cid) for cid in batch))
+        for cid, (children_raw, products_raw) in zip(batch, outcomes):
+            processed.add(cid)
+            if isinstance(products_raw, list):
+                for p in products_raw:
+                    if len(accum) >= _MAX_PRODUCTS_COLLECTED:
+                        break
+                    accum.append(p)
+            for child_id in _child_category_ids_from_response(children_raw):
+                queue.append(child_id)
+            if len(accum) >= _MAX_PRODUCTS_COLLECTED:
+                break
+
+    deduped = _dedupe_raw_products_by_id(accum)
+    return _normalize_product_rows(deduped)
 
 
 @mcp.tool()
@@ -206,27 +319,38 @@ def list_product_categories(parent_id: int = 0) -> list:
 
 
 @mcp.tool()
-async def list_products_by_category(category_id: int) -> list[dict]:
-    """List every product under a Moloni category in a single call.
-    Use this to check existence of multiple product references against one
-    parent category. Much faster than calling search_product_by_reference
-    multiple times — only one Moloni API call is needed per category.
-    Returns a list of objects: [{"product_id": int, "reference": str,
-    "name": str, "price": float, "category_id": int, "ean": str}, ...].
-    Empty list if the category has no products.
+async def list_products_by_category(category_id: int, recursive: bool = True) -> list[dict]:
+    """List every product under a Moloni category, INCLUDING subcategories.
+    Pass a parent category and you get back every product anywhere in its
+    tree in one call. Use this to check existence of multiple product
+    references against a known parent — much faster than calling
+    search_product_by_reference repeatedly.
+    Set recursive=False to limit to products filed directly in this exact
+    category and ignore subcategories.
+    Returns: [{"product_id": int, "reference": str, "name": str,
+    "price": float, "category_id": int, "ean": str}, ...]. Empty if none.
     """
-    raw = await asyncio.to_thread(get_products_by_category, category_id)
-    return [
-        {
-            "product_id": p.get("product_id") or 0,
-            "reference": p.get("reference") or "",
-            "name": p.get("name") or "",
-            "price": float(p.get("price") or 0),
-            "category_id": p.get("category_id") or 0,
-            "ean": p.get("ean") or "",
-        }
-        for p in (raw if isinstance(raw, list) else [])
-    ]
+    now = time.monotonic()
+    cache_key = (category_id, recursive)
+    cached = _category_products_cache.get(cache_key)
+    if cached and now - cached[0] < _CACHE_TTL:
+        return cached[1]
+
+    timeout = (
+        _CATEGORY_LIST_TIMEOUT_RECURSIVE if recursive else _CATEGORY_LIST_TIMEOUT_FLAT
+    )
+    try:
+        result = await asyncio.wait_for(
+            _list_products_by_category_uncached(category_id, recursive),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return []
+
+    if len(_category_products_cache) >= _CACHE_MAX:
+        _category_products_cache.clear()
+    _category_products_cache[cache_key] = (time.monotonic(), result)
+    return result
 
 
 @mcp.tool()
