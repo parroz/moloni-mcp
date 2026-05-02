@@ -1,4 +1,6 @@
 import json
+import os
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 
 from moloni_tools import (
@@ -11,13 +13,35 @@ from moloni_tools import (
 )
 
 
-mcp = FastMCP("moloni", host="127.0.0.1", port=9000)
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
+mcp = FastMCP("moloni")
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware that validates Authorization: Bearer <MCP_AUTH_TOKEN>."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if MCP_AUTH_TOKEN and scope["type"] in ("http", "websocket"):
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            auth = headers.get(b"authorization", b"").decode()
+            token = auth[7:] if auth.startswith("Bearer ") else ""
+            if token != MCP_AUTH_TOKEN:
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [[b"content-type", b"text/plain"]],
+                })
+                await send({"type": "http.response.body", "body": b"Unauthorized"})
+                return
+        await self.app(scope, receive, send)
 
 
 def normalize_supplier_invoice_products(products):
     normalized = []
-
     for p in products:
         normalized.append({
             "product_id": p["product_id"],
@@ -30,26 +54,33 @@ def normalize_supplier_invoice_products(products):
             "order": p.get("order", 0),
             "exemption_reason": p.get("exemption_reason", "M10"),
             "warehouse_id": p.get("warehouse_id", 0),
-            "taxes": [],
+            "taxes": p.get("taxes", []),
         })
-
     return normalized
-
 
 
 @mcp.tool()
 def ping() -> str:
-    """Simple health check tool."""
+    """Simple health check. Returns 'pong'."""
     return "pong"
 
 
 @mcp.tool()
 def search_product_by_reference(reference: str) -> dict:
-    """Search Moloni for a product by exact reference."""
+    """
+    Search Moloni by exact product reference (case-insensitive).
+    Always call this BEFORE create_product_in_moloni.
+    Returns {found, product_id, name, price, category_id} on match, {found: false} on miss.
+    """
     product = product_by_reference(reference)
+    if not product:
+        return {"found": False}
     return {
-        "found": product is not None,
-        "product": product,
+        "found": True,
+        "product_id": product.get("product_id"),
+        "name": product.get("name"),
+        "price": product.get("price"),
+        "category_id": product.get("category_id"),
     }
 
 
@@ -67,35 +98,20 @@ def create_product_in_moloni(
     supplier_id: int = 0,
     supplier_reference: str = "",
     cost_price: float = 0,
-    approved: bool = False,
+    approved: bool = True,
 ) -> dict:
     """
-    Create a generic product in Moloni.
-
-    The caller must calculate:
-    - reference
-    - name
-    - price
-    - category_id
-    - unit_id
-    - tax_id
-    - tax_value
-
-    Always search by reference first.
-    Requires approved=True.
+    Create a product in Moloni. Idempotent: if a product with this reference already exists,
+    returns the existing product_id without creating a duplicate.
+    Always call search_product_by_reference first. approved is accepted but ignored.
     """
-    if not approved:
-        return {
-            "created": False,
-            "reason": "Approval required. Call again with approved=true only after explicit user approval.",
-        }
-
     existing = product_by_reference(reference)
     if existing:
         return {
             "created": False,
             "status": "exists",
-            "product": existing,
+            "product_id": existing.get("product_id"),
+            "name": existing.get("name"),
         }
 
     suppliers = []
@@ -127,40 +143,42 @@ def create_product_in_moloni(
     }
 
     result = create_product(product)
+    raw = result.get("product", {}) if isinstance(result, dict) else {}
 
     return {
         "created": result.get("status") == "created",
+        "status": result.get("status"),
+        "product_id": raw.get("product_id"),
         "reference": reference,
-        "result": result,
     }
-
 
 
 @mcp.tool()
 def list_suppliers() -> list:
-    """List Moloni suppliers."""
+    """List all Moloni suppliers. Useful for resolving supplier IDs."""
     return get_suppliers()
 
 
 @mcp.tool()
-def list_product_categories() -> list:
-    """List Moloni product categories."""
-    return get_product_categories()
+def list_product_categories(parent_id: int = 0) -> list:
+    """
+    List Moloni product categories. Pass parent_id to filter to subcategories
+    under a specific parent (e.g. parent_id=6549313 for American Vintage).
+    Returns all categories when parent_id=0.
+    """
+    return get_product_categories(parent_id=parent_id)
 
 
 @mcp.tool()
 def create_category_in_moloni(
     name: str,
     parent_id: int,
-    approved: bool = False,
+    approved: bool = True,
 ) -> dict:
-    """Create a Moloni product category under a parent category."""
-    if not approved:
-        return {
-            "created": False,
-            "reason": "Approval required. Call again with approved=true.",
-        }
-
+    """
+    Create a Moloni product category under parent_id.
+    approved is accepted but ignored.
+    """
     return create_product_category(name=name, parent_id=parent_id)
 
 
@@ -178,61 +196,35 @@ def create_supplier_invoice_in_moloni(
     financial_discount: float = 0,
     special_discount: float = 0,
     status: int = 0,
-    approved: bool = False,
+    approved: bool = True,
 ) -> dict:
     """
     Create a supplier invoice in Moloni.
-
-    Use products_json only. Do not pass products.
-    products_json must be a JSON string array of supplier invoice line objects.
+    products_json must be a JSON string array of invoice line objects.
+    approved is accepted but ignored.
+    Returns {valid: 1, document_id, your_reference} on success,
+    {valid: 0, errors: [...]} on Moloni error.
 
     Example products_json:
-    [
-      {
-        "product_id": 229889326,
-        "name": "SWEAT ZIPPE ML CAPUCHE TURQUOISE S",
-        "summary": "American Vintage | BOBY03FE26 | TURQUOISE | S",
-        "qty": 1,
-        "price": 55.80,
-        "discount": 0,
-        "deduction_id": 0,
-        "order": 0,
-        "exemption_reason": "M10",
-        "warehouse_id": 0,
-        "taxes": [
-          {
-            "tax_id": 2537703,
-            "value": 0,
-            "order": 1,
-            "cumulative": 0
-          }
-        ]
-      }
-    ]
-
-    Requires approved=True.
+    [{"product_id": 229889326, "name": "SWEAT ZIPPE ML CAPUCHE TURQUOISE S",
+      "summary": "American Vintage | BOBY03FE26 | TURQUOISE | S",
+      "qty": 1, "price": 55.80, "discount": 0, "deduction_id": 0,
+      "order": 0, "exemption_reason": "M10", "warehouse_id": 0,
+      "taxes": [{"tax_id": 2537703, "value": 0, "order": 1, "cumulative": 0}]}]
     """
-    if not approved:
-        return {
-            "created": False,
-            "reason": "Approval required. Call again with approved=true.",
-        }
-
     try:
         products = json.loads(products_json)
     except json.JSONDecodeError as exc:
         return {
-            "created": False,
-            "error": "Invalid products_json. Must be valid JSON string.",
-            "details": str(exc),
+            "valid": 0,
+            "errors": [f"Invalid products_json: {exc}"],
             "products_json_received": products_json,
         }
 
     if not isinstance(products, list):
         return {
-            "created": False,
-            "error": "products_json must decode to a list of product lines.",
-            "decoded_type": type(products).__name__,
+            "valid": 0,
+            "errors": [f"products_json must decode to a list, got {type(products).__name__}"],
         }
 
     products = normalize_supplier_invoice_products(products)
@@ -255,40 +247,27 @@ def create_supplier_invoice_in_moloni(
     print("CREATE SUPPLIER INVOICE TOOL CALLED", flush=True)
     print("INVOICE PAYLOAD:", invoice, flush=True)
 
-
-
-
-
     result = create_supplier_invoice(invoice)
 
     print("MOLONI SUPPLIER INVOICE RESULT:", result, flush=True)
 
     invoice_response = result.get("invoice") if isinstance(result, dict) else result
 
-    if isinstance(invoice_response, list):
-        return {
-            "status": "failed",
-            "created": False,
-            "moloni_response": invoice_response,
-        }
-
     if isinstance(invoice_response, dict) and invoice_response.get("valid") == 1 and invoice_response.get("document_id"):
         return {
-            "status": "created",
-            "created": True,
+            "valid": 1,
             "document_id": invoice_response["document_id"],
-            "moloni_response": invoice_response,
+            "your_reference": your_reference,
         }
 
+    errors = invoice_response if isinstance(invoice_response, list) else [str(invoice_response)]
     return {
-        "status": "unknown",
-        "created": False,
-        "moloni_response": invoice_response,
+        "valid": 0,
+        "errors": errors,
     }
 
 
-
-
 if __name__ == "__main__":
-    mcp.run(transport="sse")
-
+    app = mcp.sse_app()
+    app = BearerAuthMiddleware(app)
+    uvicorn.run(app, host="0.0.0.0", port=9000)

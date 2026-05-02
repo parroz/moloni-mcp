@@ -153,8 +153,10 @@ def get_suppliers() -> list:
     return moloni_post("suppliers/getAll", body)
 
 
-def get_product_categories() -> list:
+def get_product_categories(parent_id: int = 0) -> list:
     body = {"company_id": COMPANY_ID}
+    if parent_id:
+        body["parent_id"] = parent_id
     return moloni_post("productCategories/getAll", body)
 
 
